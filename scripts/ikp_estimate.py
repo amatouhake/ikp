@@ -38,6 +38,7 @@ import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 
@@ -46,7 +47,14 @@ PROJECT_ROOT = Path(__file__).parent.parent
 PROBE_FILE = PROJECT_ROOT / "data" / "probes" / "final_probe_set_v8.json"
 SYSTEM_MSG = "Answer factual questions directly and concisely. If you don't know, say 'I don't know'."
 JUDGE_MODEL = "google/gemini-3-flash-preview"
+OPENCODE_GO_USER_AGENT = "amatouhake-ikp/0.1 (+https://github.com/amatouhake/ikp)"
 HALLUCINATION_PENALTY = 0.0  # no penalty: wrong answers score the same as refusals (λ=0)
+TIERS = ["T1", "T2", "T3", "T4", "T5", "T6", "T7"]
+API_STYLES = ("chat", "responses")
+REASONING_EFFORTS = ("default", "low", "medium", "high", "xhigh")
+DEFAULT_SAMPLE_SEED = 42
+MAX_API_ATTEMPTS = 3
+RETRY_BACKOFF_SECONDS = 3
 
 # Calibration curve. The single source of truth for effective-parameter
 # estimates is data/results/effective_params.json, stored as
@@ -57,6 +65,22 @@ HALLUCINATION_PENALTY = 0.0  # no penalty: wrong answers score the same as refus
 # the artifact with scripts/19_effective_params.py after changing the cohort.
 CALIB_FILE = PROJECT_ROOT / "data" / "results" / "calibration_refit_v2.json"
 EFFECTIVE_PARAMS_FILE = PROJECT_ROOT / "data" / "results" / "effective_params.json"
+
+
+class APIRequestError(RuntimeError):
+    """An API failure that must never be converted into a benchmark verdict."""
+
+    def __init__(self, message: str, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class TargetAPIError(APIRequestError):
+    """The target model request failed or returned an unusable response."""
+
+
+class JudgeAPIError(APIRequestError):
+    """The fixed benchmark judge request failed or returned an unusable response."""
 
 
 def _load_calibration():
@@ -108,11 +132,14 @@ TIER_INFO = {
 def strip_thinking(text: str) -> str:
     if not text:
         return ""
-    cleaned = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
-    if cleaned.startswith('<think>'):
-        end = cleaned.find('</think>')
-        cleaned = cleaned[end + 8:].strip() if end >= 0 else ''
-    return cleaned or text
+    # Reasoning is a separate field in the Responses API and must not be
+    # scored.  Some chat-compatible providers still wrap it in <think> tags;
+    # remove complete and truncated blocks without falling back to the block.
+    cleaned = re.sub(r'<think>.*?</think>', '', text,
+                     flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r'<think>.*$', '', cleaned,
+                     flags=re.DOTALL | re.IGNORECASE)
+    return cleaned.strip()
 
 
 def estimate_params(accuracy: float) -> float:
@@ -165,56 +192,243 @@ def refusal_summary(tier_stats: dict) -> dict:
 
 
 # ── Model query ────────────────────────────────────────────────
-def make_query_fn(api_base: str, api_key: str, model: str, is_thinking: bool):
-    """Create a function that queries the model."""
+def effective_reasoning_effort(is_thinking: bool = False,
+                               reasoning_effort: str = "default") -> str:
+    """Resolve the new effort option while retaining --thinking semantics."""
+    if reasoning_effort is None:
+        reasoning_effort = "default"
+    if reasoning_effort not in REASONING_EFFORTS:
+        raise ValueError(
+            f"reasoning_effort must be one of {', '.join(REASONING_EFFORTS)}"
+        )
+    if is_thinking and reasoning_effort == "default":
+        return "medium"
+    return reasoning_effort
 
-    def query(question: str) -> str:
+
+def build_target_request(api_base: str, model: str, question: str,
+                         api_style: str = "chat",
+                         reasoning_effort: str = "default",
+                         is_thinking: bool = False) -> tuple[str, dict]:
+    """Build one target request without adding authentication headers."""
+    if api_style not in API_STYLES:
+        raise ValueError(f"api_style must be one of {', '.join(API_STYLES)}")
+    effort = effective_reasoning_effort(is_thinking, reasoning_effort)
+
+    if api_style == "responses":
+        # This is the Responses API shape: instructions carries the system
+        # message and input is an explicit user message, rather than a
+        # chat-completions `messages` array.
         payload = {
             "model": model,
-            "messages": [
-                {"role": "system", "content": SYSTEM_MSG},
-                {"role": "user", "content": question},
-            ],
-            "temperature": 0,
+            "instructions": SYSTEM_MSG,
+            "input": [{
+                "role": "user",
+                "content": [{"type": "input_text", "text": question}],
+            }],
         }
-        if is_thinking:
-            payload["reasoning"] = {"effort": "medium"}
+        if effort != "default":
+            payload["reasoning"] = {"effort": effort}
+        return f"{api_base.rstrip('/')}/responses", payload
 
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_MSG},
+            {"role": "user", "content": question},
+        ],
+        "temperature": 0,
+    }
+    if effort != "default":
+        payload["reasoning"] = {"effort": effort}
+    return f"{api_base.rstrip('/')}/chat/completions", payload
+
+
+def target_request_preview(api_base: str, model: str,
+                           api_style: str = "chat",
+                           reasoning_effort: str = "default",
+                           is_thinking: bool = False,
+                           has_api_key: bool = False) -> dict:
+    """Return a safe request preview; it never contains an API key."""
+    endpoint, payload = build_target_request(
+        api_base, model, "<question>", api_style, reasoning_effort, is_thinking
+    )
+    headers = {"Content-Type": "application/json"}
+    if _is_opencode_go_base(api_base):
+        headers["User-Agent"] = OPENCODE_GO_USER_AGENT
+    if has_api_key:
+        headers["Authorization"] = "Bearer <redacted>"
+    return {
+        "method": "POST",
+        "url": endpoint,
+        "headers": headers,
+        "payload": payload,
+    }
+
+
+def extract_chat_text(data: dict) -> str:
+    """Extract final chat text without falling back to reasoning fields."""
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return ""
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        return ""
+    message = choice.get("message")
+    if not isinstance(message, dict):
+        return ""
+
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, dict):
+        text = content.get("text")
+        return text if isinstance(text, str) else ""
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict) and part.get("type") in ("text", "output_text"):
+                text = part.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        if parts:
+            return "".join(parts)
+
+    # Chat APIs can represent a genuine refusal separately from content. It
+    # is model output and should remain judgeable, unlike reasoning content.
+    refusal = message.get("refusal")
+    return refusal if isinstance(refusal, str) else ""
+
+
+def extract_responses_text(data: dict) -> str:
+    """Extract final assistant text while ignoring Responses reasoning items."""
+    output_text = data.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text
+
+    output = data.get("output")
+    if not isinstance(output, list):
+        return ""
+
+    final_parts = []
+    for item in output:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        if item.get("role") not in (None, "assistant"):
+            continue
+        content = item.get("content")
+        if isinstance(content, str):
+            final_parts.append(content)
+            continue
+        if isinstance(content, dict):
+            content = [content]
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, str):
+                final_parts.append(part)
+                continue
+            if not isinstance(part, dict):
+                continue
+            part_type = part.get("type")
+            if part_type in ("output_text", "text"):
+                text = part.get("text")
+            elif part_type == "refusal":
+                text = part.get("refusal") or part.get("text")
+            else:
+                # In particular, do not traverse reasoning summaries or
+                # reasoning content looking for a plausible answer.
+                text = None
+            if isinstance(text, str):
+                final_parts.append(text)
+    return "\n".join(part for part in final_parts if part)
+
+
+def _post_json(http, url: str, headers: dict, payload: dict,
+               error_type: type[APIRequestError], sleep_fn=None) -> dict:
+    """POST JSON with bounded retries for transient transport failures."""
+    sleep_fn = time.sleep if sleep_fn is None else sleep_fn
+    last_error = "request failed"
+    last_status = None
+
+    for attempt in range(MAX_API_ATTEMPTS):
+        try:
+            response = http.post(url, headers=headers, json=payload)
+        except httpx.HTTPError as exc:
+            last_error = f"network failure ({type(exc).__name__})"
+            if attempt + 1 < MAX_API_ATTEMPTS:
+                sleep_fn(RETRY_BACKOFF_SECONDS * (attempt + 1))
+            continue
+
+        status = response.status_code
+        last_status = status
+        if 200 <= status < 300:
+            try:
+                data = response.json()
+            except (TypeError, ValueError) as exc:
+                raise error_type(
+                    f"HTTP {status} returned invalid JSON ({type(exc).__name__})",
+                    status,
+                ) from exc
+            if not isinstance(data, dict):
+                raise error_type(f"HTTP {status} returned a non-object JSON response",
+                                 status)
+            if data.get("error") is not None:
+                raise error_type("server returned an API error", status)
+            return data
+
+        last_error = f"HTTP {status}"
+        if status == 429 or 500 <= status <= 599:
+            if attempt + 1 < MAX_API_ATTEMPTS:
+                sleep_fn(RETRY_BACKOFF_SECONDS * (attempt + 1))
+            continue
+        raise error_type(last_error, status)
+
+    raise error_type(last_error, last_status)
+
+
+def make_query_fn(api_base: str, api_key: str, model: str,
+                  is_thinking: bool = False, api_style: str = "chat",
+                  reasoning_effort: str = "default", client_factory=None,
+                  sleep_fn=None):
+    """Create a target query function for chat or Responses APIs."""
+    effort = effective_reasoning_effort(is_thinking, reasoning_effort)
+    client_factory = httpx.Client if client_factory is None else client_factory
+
+    def query(question: str) -> str:
+        endpoint, payload = build_target_request(
+            api_base, model, question, api_style, effort
+        )
         headers = {"Content-Type": "application/json"}
+        if _is_opencode_go_base(api_base):
+            headers["User-Agent"] = OPENCODE_GO_USER_AGENT
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
 
-        with httpx.Client(timeout=120) as http:
-            for attempt in range(3):
-                try:
-                    r = http.post(f"{api_base}/chat/completions",
-                                  headers=headers, json=payload)
-                    if r.status_code == 200:
-                        data = r.json()
-                        if "error" in data:
-                            return ""
-                        if "choices" not in data:
-                            return ""
-                        msg = data["choices"][0]["message"]
-                        content = msg.get("content") or ""
-                        if not content and msg.get("reasoning"):
-                            content = msg["reasoning"]
-                        if is_thinking and content:
-                            content = strip_thinking(content)
-                        return content
-                    elif r.status_code == 429:
-                        time.sleep(3 * (attempt + 1))
-                    else:
-                        return ""
-                except Exception:
-                    time.sleep(2)
-        return ""
+        with client_factory(timeout=120) as http:
+            data = _post_json(http, endpoint, headers, payload,
+                              TargetAPIError, sleep_fn)
 
+        if api_style == "responses":
+            content = extract_responses_text(data)
+        else:
+            content = extract_chat_text(data)
+        content = strip_thinking(content)
+        if not content.strip():
+            raise TargetAPIError("successful response contained no final textual output")
+        return content
+
+    query.api_style = api_style
+    query.reasoning_effort = effort
+    query.endpoint = f"{api_base.rstrip('/')}/{('responses' if api_style == 'responses' else 'chat/completions')}"
     return query
 
 
-def make_judge_fn(api_key: str):
-    """Create judge function using OpenRouter."""
+def make_judge_fn(api_key: str, client_factory=None, sleep_fn=None):
+    """Create judge function using the fixed OpenRouter judge."""
+    client_factory = httpx.Client if client_factory is None else client_factory
 
     def judge(question: str, gold: str, response: str) -> str:
         if not response or not response.strip():
@@ -243,33 +457,117 @@ Reply one word: CORRECT, REFUSAL, or WRONG"""
         headers = {"Content-Type": "application/json"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
+        payload = {"model": JUDGE_MODEL,
+                   "messages": [{"role": "user", "content": prompt}],
+                   "temperature": 0,
+                   "reasoning": {"effort": "low"}}
 
-        with httpx.Client(timeout=60) as http:
-            for attempt in range(3):
-                try:
-                    r = http.post("https://openrouter.ai/api/v1/chat/completions",
-                                  headers=headers,
-                                  json={"model": JUDGE_MODEL,
-                                        "messages": [{"role": "user", "content": prompt}],
-                                        "temperature": 0,
-                                        "reasoning": {"effort": "low"}})
-                    if r.status_code == 200:
-                        data = r.json()
-                        if "choices" not in data:
-                            return "WRONG"
-                        raw = data["choices"][0]["message"]["content"].strip().upper()
-                        if raw.startswith("CORRECT"):
-                            return "CORRECT"
-                        if raw.startswith("REFUSAL"):
-                            return "REFUSAL"
-                        return "WRONG"
-                    elif r.status_code == 429:
-                        time.sleep(3 * (attempt + 1))
-                except Exception:
-                    time.sleep(2)
-        return "WRONG"
+        with client_factory(timeout=60) as http:
+            data = _post_json(
+                http, "https://openrouter.ai/api/v1/chat/completions",
+                headers, payload, JudgeAPIError, sleep_fn
+            )
+
+        choices = data.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise JudgeAPIError("successful response contained no judge choice")
+        message = choices[0].get("message") if isinstance(choices[0], dict) else None
+        raw = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(raw, str) or not raw.strip():
+            raise JudgeAPIError("successful response contained no judge text")
+        raw = raw.strip()
+        if raw in ("CORRECT", "REFUSAL", "WRONG"):
+            return raw
+        raise JudgeAPIError(f"unrecognized judge verdict: {raw[:80]!r}")
 
     return judge
+
+
+def stratified_sample(probes: list, sample_size: int,
+                      seed: int = DEFAULT_SAMPLE_SEED) -> list:
+    """Select exactly sample_size probes, balanced across the seven tiers."""
+    if sample_size is None:
+        return list(probes)
+    if sample_size < 0:
+        raise ValueError("sample size must be non-negative")
+    if sample_size > len(probes):
+        raise ValueError(
+            f"sample size {sample_size} exceeds the {len(probes)} available probes"
+        )
+    if sample_size == 0:
+        return []
+
+    by_tier = {tier: [] for tier in TIERS}
+    for probe in probes:
+        if probe.get("tier") in by_tier:
+            by_tier[probe["tier"]].append(probe)
+    available = sum(len(items) for items in by_tier.values())
+    if sample_size > available:
+        raise ValueError("sample requires probes outside the T1..T7 tiers")
+
+    rng = random.Random(seed)
+    remaining_by_tier = {}
+    selected_by_tier = {}
+    base, remainder = divmod(sample_size, len(TIERS))
+    requested = {
+        tier: base + (index < remainder)
+        for index, tier in enumerate(TIERS)
+    }
+
+    for tier in TIERS:
+        candidates = list(by_tier[tier])
+        rng.shuffle(candidates)
+        take = min(requested[tier], len(candidates))
+        selected_by_tier[tier] = candidates[:take]
+        remaining_by_tier[tier] = candidates[take:]
+
+    deficit = sample_size - sum(len(items) for items in selected_by_tier.values())
+    while deficit:
+        eligible = [
+            tier for tier in TIERS
+            if remaining_by_tier[tier]
+        ]
+        if not eligible:
+            raise ValueError("not enough tiered probes to satisfy sample size")
+        # Fill a short tier first, with tier order as the deterministic tie-break.
+        tier = min(eligible, key=lambda item: (len(selected_by_tier[item]),
+                                               TIERS.index(item)))
+        selected_by_tier[tier].append(remaining_by_tier[tier].pop())
+        deficit -= 1
+
+    return [probe for tier in TIERS for probe in selected_by_tier[tier]]
+
+
+def _is_openrouter_base(api_base: str) -> bool:
+    try:
+        parsed = urlparse(api_base)
+    except ValueError:
+        return False
+    return parsed.scheme in ("http", "https") and parsed.hostname == "openrouter.ai"
+
+
+def _is_opencode_go_base(api_base: str) -> bool:
+    try:
+        parsed = urlparse(api_base)
+    except ValueError:
+        return False
+    path = parsed.path.rstrip("/")
+    return (
+        parsed.scheme in ("http", "https")
+        and parsed.hostname == "opencode.ai"
+        and (path == "/zen/go" or path.startswith("/zen/go/"))
+    )
+
+
+def resolve_target_api_key(api_base: str, explicit_api_key: str | None) -> str:
+    """Resolve only the target credential; never use it for the judge."""
+    if explicit_api_key is not None:
+        return explicit_api_key
+    if _is_opencode_go_base(api_base):
+        return os.environ.get("OPENCODE_GO_API_KEY", "")
+    if _is_openrouter_base(api_base):
+        return os.environ.get("OPENROUTER_API_KEY", "")
+    return os.environ.get("IKP_TARGET_API_KEY", "")
 
 
 # ── Display ────────────────────────────────────────────────────
@@ -305,12 +603,12 @@ def display_results(model_name: str, results: list, tier_accs: dict, accuracy: f
             continue
         correct = sum(1 for r in tier_results if r["verdict"] == "CORRECT")
         wrong = sum(1 for r in tier_results if r["verdict"] == "WRONG")
-        refusal = sum(1 for r in tier_results if r["verdict"] == "REFUSAL")
+        refusal_count = sum(1 for r in tier_results if r["verdict"] == "REFUSAL")
         total = len(tier_results)
         acc = tier_accs.get(t, 0)
         info = TIER_INFO.get(t, {})
         marker = " ◀ frontier" if acc > 0 and t in ["T5", "T6", "T7"] else ""
-        print(f"  {t:<5} {acc:>8.0%} {correct:>8} {wrong:>7} {refusal:>7} {total:>6}  "
+        print(f"  {t:<5} {acc:>8.0%} {correct:>8} {wrong:>7} {refusal_count:>7} {total:>6}  "
               f"{DIM}{info.get('range', '')}: {info.get('desc', '')}{RESET}{marker}")
 
     # Determine effective tier
@@ -427,15 +725,22 @@ def main():
     model_group.add_argument("--api-base", metavar="URL",
                              default="https://openrouter.ai/api/v1",
                              help="API base URL (default: OpenRouter)")
+    model_group.add_argument("--api-style", choices=API_STYLES, default="chat",
+                             help="Target API style: chat (default) or responses")
     model_group.add_argument("--api-key", metavar="KEY",
-                             help="API key (default: OPENROUTER_API_KEY env var)")
+                             help="Target API key (use OPENCODE_GO_API_KEY for Go)")
     model_group.add_argument("--thinking", action="store_true",
-                             help="Enable thinking/reasoning mode")
+                             help="Backward-compatible alias for --reasoning-effort medium")
+    model_group.add_argument("--reasoning-effort", choices=REASONING_EFFORTS,
+                             default="default", metavar="EFFORT",
+                             help="Target reasoning override: default, low, medium, high, xhigh")
 
     # Evaluation options
     eval_group = parser.add_argument_group("Evaluation")
     eval_group.add_argument("--sample", "-n", type=int, metavar="N",
-                            help="Sample N probes (default: use all 1400)")
+                            help="Sample exactly N probes, balanced across T1..T7 (default: all)")
+    eval_group.add_argument("--seed", type=int, default=DEFAULT_SAMPLE_SEED,
+                            help=f"Sampling seed (default: {DEFAULT_SAMPLE_SEED})")
     eval_group.add_argument("--workers", "-w", type=int, default=16,
                             help="Parallel workers (default: 16)")
     eval_group.add_argument("--sequential", "-s", action="store_true",
@@ -451,8 +756,24 @@ def main():
                                help="Inspect the probe set and exit")
     display_group.add_argument("--show-calibration", action="store_true",
                                help="Show calibration curve info and exit")
+    display_group.add_argument("--request-preview", action="store_true",
+                               help="Print a redacted target request preview and exit")
 
     args = parser.parse_args()
+    requested_effort = effective_reasoning_effort(args.thinking, args.reasoning_effort)
+
+    # This mode is deliberately evaluated before loading probes or resolving
+    # environment variables, so it cannot make a network call or expose a key.
+    if args.request_preview:
+        print(json.dumps(
+            target_request_preview(
+                args.api_base, args.model or "<model>", args.api_style,
+                args.reasoning_effort, args.thinking, bool(args.api_key)
+            ),
+            indent=2,
+            ensure_ascii=False,
+        ))
+        return
 
     # Info-only modes
     if args.show_calibration:
@@ -469,39 +790,51 @@ def main():
         parser.print_help()
         return
 
-    # Set up API
-    api_key = args.api_key or os.environ.get("OPENROUTER_API_KEY", "")
-    if not api_key and "openrouter" in args.api_base:
-        print("Error: OPENROUTER_API_KEY not set. Use --api-key or set the env var.")
+    # Set up separate target and judge credentials. The target credential is
+    # never used as a fallback for the fixed OpenRouter judge.
+    api_key = resolve_target_api_key(args.api_base, args.api_key)
+    if not api_key and (_is_openrouter_base(args.api_base) or
+                        _is_opencode_go_base(args.api_base)):
+        env_name = ("OPENCODE_GO_API_KEY" if _is_opencode_go_base(args.api_base)
+                    else "OPENROUTER_API_KEY")
+        print(f"Error: {env_name} not set for the target. Use --api-key or set the env var.")
         sys.exit(1)
 
-    # Sample probes if requested
-    if args.sample:
-        # Stratified sample: equal per tier
-        per_tier = max(args.sample // 7, 1)
-        sampled = []
-        for t in ["T1", "T2", "T3", "T4", "T5", "T6", "T7"]:
-            tier_probes = [p for p in probes if p["tier"] == t]
-            sampled.extend(random.sample(tier_probes, min(per_tier, len(tier_probes))))
-        probes = sampled
+    # Sample probes if requested. The local RNG keeps repeated seeds
+    # independent of any other random use in this process.
+    if args.sample is not None:
+        try:
+            probes = stratified_sample(probes, args.sample, args.seed)
+        except ValueError as exc:
+            parser.error(str(exc))
+    selected_probe_ids = [probe.get("id", "") for probe in probes]
+
+    # Check the judge credential before spending a target request.
+    judge_key = os.environ.get("OPENROUTER_API_KEY", "")
+    if not judge_key:
+        print("  Error: OPENROUTER_API_KEY needed for the judge model. Set it as env var.")
+        sys.exit(1)
 
     # Pre-test the model
     print(f"\n  Testing {args.model}...")
-    query_fn = make_query_fn(args.api_base, api_key, args.model, args.thinking)
-    test_resp = query_fn("What is the capital of France?")
-    if not test_resp:
-        print(f"  Error: model returned empty response. Check your --model and --api-base.")
+    query_fn = make_query_fn(
+        args.api_base, api_key, args.model, args.thinking,
+        args.api_style, args.reasoning_effort
+    )
+    try:
+        test_resp = query_fn("What is the capital of France?")
+    except TargetAPIError as exc:
+        print(f"  Error: target API request failed; run aborted ({exc})",
+              file=sys.stderr)
         sys.exit(1)
     if "paris" not in test_resp.lower():
         print(f"  Warning: unexpected test response: {test_resp[:100]}")
     else:
         print(f"  Model OK: {test_resp[:60]}")
-
-    # Judge always uses OpenRouter (needs valid OPENROUTER_API_KEY)
-    judge_key = os.environ.get("OPENROUTER_API_KEY", api_key)
-    if not judge_key:
-        print(f"  Error: OPENROUTER_API_KEY needed for the judge model. Set it as env var.")
-        sys.exit(1)
+    print(f"  Target transport: {args.api_style}; reasoning effort requested: {requested_effort}")
+    if requested_effort != "default":
+        print("  Note: reasoning effort is requested but not verified as active; "
+              "confirm it with the canary response/provider behavior.")
     judge_fn = make_judge_fn(judge_key)
 
     # Run evaluation
@@ -515,8 +848,22 @@ def main():
     def eval_one(probe):
         q = probe["question"]
         gold = probe["answer"]
-        response = query_fn(q)
-        verdict = judge_fn(q, gold, response)
+        response = ""
+        error_type = None
+        error_message = None
+        try:
+            response = query_fn(q)
+        except TargetAPIError as exc:
+            error_type = "target_api"
+            error_message = str(exc)
+        if error_type is None:
+            try:
+                verdict = judge_fn(q, gold, response)
+            except JudgeAPIError as exc:
+                error_type = "judge_api"
+                error_message = str(exc)
+        if error_type is not None:
+            verdict = "INFRASTRUCTURE_ERROR"
 
         with _lock:
             _done[0] += 1
@@ -533,6 +880,8 @@ def main():
             "gold_answer": gold,
             "response": (response or "")[:500],
             "verdict": verdict,
+            **({"error_type": error_type, "error": error_message}
+               if error_type else {}),
         }
 
     workers = 1 if args.sequential else args.workers
@@ -543,6 +892,48 @@ def main():
 
     sys.stderr.write("\r" + " " * 60 + "\r")
     sys.stderr.flush()
+
+    infrastructure_errors = [
+        result for result in results
+        if result.get("verdict") == "INFRASTRUCTURE_ERROR"
+    ]
+    if infrastructure_errors:
+        print(
+            f"Error: {len(infrastructure_errors)} infrastructure error(s); "
+            "no estimate was computed or scored.",
+            file=sys.stderr,
+        )
+        for result in infrastructure_errors[:3]:
+            print(f"  {result['probe_id']}: {result['error_type']} - "
+                  f"{result['error']}", file=sys.stderr)
+        if args.output:
+            failure_output = {
+                "status": "failed",
+                "error": "infrastructure_error",
+                "model": args.model,
+                "api_base": args.api_base,
+                "api_style": args.api_style,
+                "reasoning_effort": requested_effort,
+                "reasoning_effort_requested": requested_effort,
+                "reasoning_effort_verification": (
+                    "not_requested" if requested_effort == "default"
+                    else "requested_unverified"
+                ),
+                "seed": args.seed,
+                "selected_probe_ids": selected_probe_ids,
+                "target_request_preview": target_request_preview(
+                    args.api_base, args.model, args.api_style,
+                    args.reasoning_effort, args.thinking, bool(api_key)
+                ),
+                "infrastructure_errors": infrastructure_errors,
+                "results": results,
+            }
+            output_path = Path(args.output)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            with output_path.open("w") as f:
+                json.dump(failure_output, f, indent=2, ensure_ascii=False)
+            print(f"  Failure details saved to {args.output}")
+        sys.exit(1)
 
     # Compute scores
     from collections import defaultdict
@@ -579,8 +970,22 @@ def main():
     # Save if requested
     if args.output:
         output = {
+            "status": "completed",
             "model": args.model,
             "api_base": args.api_base,
+            "api_style": args.api_style,
+            "reasoning_effort": requested_effort,
+            "reasoning_effort_requested": requested_effort,
+            "reasoning_effort_verification": (
+                "not_requested" if requested_effort == "default"
+                else "requested_unverified"
+            ),
+            "seed": args.seed,
+            "selected_probe_ids": selected_probe_ids,
+            "target_request_preview": target_request_preview(
+                args.api_base, args.model, args.api_style,
+                args.reasoning_effort, args.thinking, bool(api_key)
+            ),
             "probes_used": len(results),
             "accuracy": accuracy,
             "raw_accuracy": raw_accuracy,
@@ -599,7 +1004,9 @@ def main():
             },
             "results": results,
         }
-        with open(args.output, "w") as f:
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open("w") as f:
             json.dump(output, f, indent=2, ensure_ascii=False)
         print(f"  Results saved to {args.output}")
 

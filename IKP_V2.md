@@ -66,9 +66,22 @@ python scripts/ikp_estimate_v2.py --model openai/gpt-4.1
 # Re-score an existing v1 run offline — no API key, no new spend
 python scripts/ikp_estimate_v2.py --from-results runs/gpt-4.1.json
 
+# Use OpenCode Go as the target; OpenRouter remains the fixed judge
+export OPENCODE_GO_API_KEY=...
+export OPENROUTER_API_KEY=...
+python scripts/ikp_estimate_v2.py \
+  --api-base https://opencode.ai/zen/go/v1 \
+  --api-style responses \
+  --model muse-spark-1.3-contributor \
+  --reasoning-effort xhigh
+
 # (Re)generate the split manifest
 python scripts/make_probe_split.py
 ```
+
+The v2 `--thinking` flag remains a compatibility alias for medium target
+reasoning. `xhigh` is requested only when explicitly selected; confirm that
+OpenCode Go and Muse apply it from a canary response or provider behavior.
 
 ## Validation — how you know these numbers are real, not fabricated
 

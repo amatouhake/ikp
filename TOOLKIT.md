@@ -31,6 +31,46 @@ an estimated parameter count. Typical cost per run: **$0.10–$3** at
 OpenRouter list prices, depending on the target model and thinking
 budget.
 
+## OpenCode Go target: Muse Spark 1.3 Contributor
+
+OpenCode Go is the target provider in this example. The benchmark judge
+remains the fixed OpenRouter model `google/gemini-3-flash-preview`.
+Keep the two credentials separate, and never commit either API key.
+
+```bash
+export OPENCODE_GO_API_KEY=...
+export OPENROUTER_API_KEY=...
+
+# Small canary: exactly 10 benchmark probes, stratified with seed 42
+python scripts/ikp_estimate.py \
+  --api-base https://opencode.ai/zen/go/v1 \
+  --api-style responses \
+  --model muse-spark-1.3-contributor \
+  --reasoning-effort xhigh \
+  --sample 10 \
+  --seed 42 \
+  --workers 2 \
+  --output runs/muse-spark-1.3-canary.json
+
+# Planned stratified run: exactly 200 benchmark probes, same seed and xhigh
+python scripts/ikp_estimate.py \
+  --api-base https://opencode.ai/zen/go/v1 \
+  --api-style responses \
+  --model muse-spark-1.3-contributor \
+  --reasoning-effort xhigh \
+  --sample 200 \
+  --seed 42 \
+  --workers 2 \
+  --output runs/muse-spark-1.3-200-xhigh.json
+```
+
+The `--request-preview` option prints the redacted target URL and JSON
+body without making a request. Output JSON records the requested
+reasoning effort, seed, selected probe IDs, and a key-free request
+preview. `xhigh` is only a request: confirm that Muse/OpenCode Go
+supports and applies it from the canary response or provider behavior;
+an HTTP success alone is not treated as proof.
+
 ## Budgeting a run (before you spend a token)
 
 Not sure a run fits your wallet? `scripts/ikp_budget.py` prices it
@@ -87,16 +127,19 @@ python scripts/ikp_estimate.py [options]
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--model, -m MODEL` | — | Target model ID for the `/chat/completions` endpoint. E.g. `openai/gpt-4.1`, `anthropic/claude-opus-4.7`, or a custom name on your own server. |
+| `--model, -m MODEL` | — | Target model ID for the selected API style. E.g. `openai/gpt-4.1`, `anthropic/claude-opus-4.7`, or a custom name on your own server. |
 | `--api-base URL` | `https://openrouter.ai/api/v1` | Any OpenAI-compatible endpoint (OpenRouter, OpenAI, vLLM, llama-server, Together, Fireworks, …). |
-| `--api-key KEY` | `$OPENROUTER_API_KEY` | Bearer token for `--api-base`. |
-| `--thinking` | off | Pass `reasoning: {"effort":"medium"}` to the target model. Use for Claude `-think`, Gemini `-think`, GPT-5 thinking variants, GLM `-think`, etc. (The judge always runs with `reasoning.effort=low` regardless of this flag.) |
+| `--api-style {chat,responses}` | `chat` | Target wire format. `responses` posts to `<api-base>/responses`; `chat` retains the existing `/chat/completions` behavior. |
+| `--api-key KEY` | provider-specific | Bearer token for the target only. OpenCode Go can use `$OPENCODE_GO_API_KEY`; the judge always uses `$OPENROUTER_API_KEY`. |
+| `--reasoning-effort {default,low,medium,high,xhigh}` | `default` | Explicit target reasoning override. `default` sends no override. |
+| `--thinking` | off | Backward-compatible alias for `--reasoning-effort medium`. The fixed judge remains at `reasoning.effort=low`. |
 
 ### Evaluation
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--sample, -n N` | all 1400 | Stratified random sample: `N/7` probes per tier. Use 200–400 for a fast first pass. |
+| `--sample, -n N` | all 1400 | Select exactly `N` probes when enough probes exist, distributed as evenly as possible across T1..T7. |
+| `--seed SEED` | `42` | Fixed seed for deterministic stratified probe selection; the seed and selected IDs are saved in output JSON. |
 | `--workers, -w N` | 16 | Parallel requests. Lower this if your provider rate-limits. |
 | `--sequential, -s` | off | Force `workers=1`. |
 | `--output, -o FILE` | — | Dump full per-probe results + calibration metadata to JSON. |
@@ -108,18 +151,23 @@ python scripts/ikp_estimate.py [options]
 | `--inspect` | After scoring, print every probe with model answer, gold, and verdict, grouped by tier — useful for qualitative analysis. |
 | `--inspect-probes` | Do **not** call the API; print the probe set by tier and exit. |
 | `--show-calibration` | Print the calibration formula, reference points, and R² and exit. |
+| `--request-preview` | Print the key-free target request shape and exit without loading probes or calling an API. |
 
 ## Environment variables
 
 | Variable | Required | Used for |
 |---|---|---|
-| `OPENROUTER_API_KEY` | always (for the judge) | `google/gemini-3-flash-preview` judge call |
-| — | optional | If `--api-base` is not OpenRouter, also pass `--api-key` for the target endpoint |
+| `OPENROUTER_API_KEY` | always | Fixed `google/gemini-3-flash-preview` judge call; also the default target credential when using OpenRouter |
+| `OPENCODE_GO_API_KEY` | optional | Target credential for an OpenCode Go base when `--api-key` is omitted |
+| `IKP_TARGET_API_KEY` | optional | Generic custom-target credential when `--api-key` is omitted |
 
 The judge is hard-coded to OpenRouter because we want every reported
 number in the paper to have been graded by the same judge. To change
 the judge model, edit `JUDGE_MODEL` near the top of
 `scripts/ikp_estimate.py`.
+
+`OPENROUTER_API_KEY` is not used as an implicit OpenCode Go credential;
+use `OPENCODE_GO_API_KEY` or `--api-key`. Do not commit either key.
 
 ## Output format
 
@@ -127,14 +175,22 @@ With `--output out.json`:
 
 ```json
 {
+  "status": "completed",
   "model": "openai/gpt-4.1",
   "api_base": "https://openrouter.ai/api/v1",
+  "api_style": "chat",
+  "reasoning_effort": "default",
+  "reasoning_effort_requested": "default",
+  "reasoning_effort_verification": "not_requested",
+  "seed": 42,
+  "selected_probe_ids": ["IKP_T1_0001", "…"],
   "probes_used": 1400,
   "accuracy":      0.639,      // λ=0: correct / total, averaged per tier (no penalty)
   "raw_accuracy":  0.639,      // overall correct / total
   "estimated_params_B": 663.6,
   "tier_accuracy": {"T1": 0.99, …, "T7": 0.04},
   "tier_stats":    {"T1": {"correct":…, "total":…, "refusal":…, "wrong":…}, …},
+  "target_request_preview": {"method": "POST", "url": "…", "payload": {"…": "…"}},
   "calibration": {"slope": 6.701, "intercept": -1.461,
                    "n_models": 89, "r_squared": 0.907},
   "results":       [ /* 1400 per-probe records */ ]
@@ -195,9 +251,9 @@ open-weight models are added.
 - **Tiny probe samples.** `--sample` < 100 has visibly wider
   prediction intervals. The curve is meant to be read at the full
   1,400 probe budget.
-- **Thinking flag.** Passing `--thinking` to a non-reasoning model is a
-  no-op on most providers, but some 400 error out. If in doubt,
-  run once without.
+- **Reasoning effort.** A requested reasoning level can be rejected or
+  ignored by a provider. The estimator records it as requested/unverified;
+  confirm `xhigh` with a canary response before comparing runs.
 - **Non-English knowledge.** The benchmark is English only; applying it
   to a model optimized for a single non-English language underestimates
   capacity.
