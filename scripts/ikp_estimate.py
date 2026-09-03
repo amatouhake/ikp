@@ -603,12 +603,12 @@ def display_results(model_name: str, results: list, tier_accs: dict, accuracy: f
             continue
         correct = sum(1 for r in tier_results if r["verdict"] == "CORRECT")
         wrong = sum(1 for r in tier_results if r["verdict"] == "WRONG")
-        refusal = sum(1 for r in tier_results if r["verdict"] == "REFUSAL")
+        refusal_count = sum(1 for r in tier_results if r["verdict"] == "REFUSAL")
         total = len(tier_results)
         acc = tier_accs.get(t, 0)
         info = TIER_INFO.get(t, {})
         marker = " ◀ frontier" if acc > 0 and t in ["T5", "T6", "T7"] else ""
-        print(f"  {t:<5} {acc:>8.0%} {correct:>8} {wrong:>7} {refusal:>7} {total:>6}  "
+        print(f"  {t:<5} {acc:>8.0%} {correct:>8} {wrong:>7} {refusal_count:>7} {total:>6}  "
               f"{DIM}{info.get('range', '')}: {info.get('desc', '')}{RESET}{marker}")
 
     # Determine effective tier

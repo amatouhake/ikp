@@ -1,9 +1,11 @@
 import importlib
+import io
 import json
 import os
 import sys
 import unittest
 from collections import Counter
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -264,6 +266,42 @@ class IKPEstimateTransportTests(unittest.TestCase):
         self.assertEqual(request["json"]["reasoning"], {"effort": "low"})
         self.assertIn("Reply one word: CORRECT, REFUSAL, or WRONG",
                       request["json"]["messages"][0]["content"])
+
+    def test_display_results_preserves_refusal_summary_dict(self):
+        results = [
+            {
+                "tier": "T1",
+                "verdict": "REFUSAL",
+                "question": "question",
+                "gold_answer": "answer",
+                "response": "",
+            },
+            {
+                "tier": "T1",
+                "verdict": "CORRECT",
+                "question": "question 2",
+                "gold_answer": "answer 2",
+                "response": "answer 2",
+            },
+        ]
+        refusal = {
+            "refusal_rate": 0.5,
+            "confidence": "Low confidence",
+            "n_eff_floor_B": 1.0,
+            "n_eff_adjusted_B": 2.0,
+        }
+
+        with redirect_stdout(io.StringIO()):
+            ikp.display_results(
+                "model",
+                results,
+                {"T1": 0.5},
+                0.5,
+                0.5,
+                1.0,
+                refusal,
+                False,
+            )
 
 
 class IKPSamplingTests(unittest.TestCase):
