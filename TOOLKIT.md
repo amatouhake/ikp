@@ -45,7 +45,6 @@ export OPENROUTER_API_KEY=...
 python scripts/ikp_estimate.py \
   --api-base https://opencode.ai/zen/go/v1 \
   --api-style responses \
-  --api-key "$OPENCODE_GO_API_KEY" \
   --model muse-spark-1.3-contributor \
   --reasoning-effort xhigh \
   --sample 10 \
@@ -57,7 +56,6 @@ python scripts/ikp_estimate.py \
 python scripts/ikp_estimate.py \
   --api-base https://opencode.ai/zen/go/v1 \
   --api-style responses \
-  --api-key "$OPENCODE_GO_API_KEY" \
   --model muse-spark-1.3-contributor \
   --reasoning-effort xhigh \
   --sample 200 \

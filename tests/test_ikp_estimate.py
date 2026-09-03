@@ -161,6 +161,32 @@ class IKPEstimateTransportTests(unittest.TestCase):
                 "target-key",
             )
 
+    def test_provider_detection_rejects_lookalike_hostnames(self):
+        self.assertTrue(ikp._is_openrouter_base("https://openrouter.ai/api/v1"))
+        self.assertTrue(ikp._is_opencode_go_base(
+            "https://opencode.ai/zen/go/v1"
+        ))
+
+        lookalikes = [
+            "https://openrouter.ai.attacker.example/v1",
+            "https://opencode.ai.attacker.example/zen/go/v1",
+            "https://attacker.example/opencode.ai/zen/go/v1",
+            "https://opencode.ai/zen/go.evil/v1",
+        ]
+        with patch.dict(os.environ, {
+            "OPENROUTER_API_KEY": "judge-key",
+            "OPENCODE_GO_API_KEY": "go-key",
+            "IKP_TARGET_API_KEY": "generic-key",
+        }, clear=True):
+            for api_base in lookalikes:
+                with self.subTest(api_base=api_base):
+                    self.assertFalse(ikp._is_openrouter_base(api_base))
+                    self.assertFalse(ikp._is_opencode_go_base(api_base))
+                    self.assertEqual(
+                        ikp.resolve_target_api_key(api_base, None),
+                        "generic-key",
+                    )
+
     def test_target_api_failure_is_not_a_refusal(self):
         client = FakeClient([
             FakeResponse(503, {}),
@@ -191,6 +217,20 @@ class IKPEstimateTransportTests(unittest.TestCase):
         with self.assertRaises(ikp.JudgeAPIError):
             judge("question", "gold", "answer")
         self.assertEqual(len(client.requests), 3)
+
+    def test_judge_rejects_unrecognized_labels(self):
+        for label in ("I cannot decide", "CORRECTNESS"):
+            with self.subTest(label=label):
+                client = FakeClient([FakeResponse(200, {
+                    "choices": [{"message": {"content": label}}]
+                })])
+                judge = ikp.make_judge_fn(
+                    "judge-key", client_factory=lambda timeout: client,
+                    sleep_fn=lambda seconds: None,
+                )
+
+                with self.assertRaises(ikp.JudgeAPIError):
+                    judge("question", "gold", "answer")
 
     def test_judge_success_keeps_fixed_request_and_scoring(self):
         client = FakeClient([FakeResponse(200, {

@@ -275,11 +275,12 @@ def show_list(prices, n_probes, thinking, source):
 
 # ── Main ───────────────────────────────────────────────────────
 def resolve_probe_count(sample):
-    """Mirror ikp_estimate.py's stratified sampling: N//7 per tier × 7 tiers."""
-    if not sample:
+    """Return the exact requested sample count, or the full set by default."""
+    if sample is None:
         return FULL_PROBE_COUNT
-    per_tier = max(sample // 7, 1)
-    return min(per_tier, 200) * 7
+    if sample < 0:
+        raise ValueError("sample size must be non-negative")
+    return sample
 
 
 def main():
@@ -307,7 +308,10 @@ def main():
     args = parser.parse_args()
 
     prices, source = fetch_live_prices(args.offline)
-    n_probes = resolve_probe_count(args.sample)
+    try:
+        n_probes = resolve_probe_count(args.sample)
+    except ValueError as exc:
+        parser.error(str(exc))
     judge_price = price_for(prices, args.judge) or PRICE_TABLE.get(JUDGE_MODEL)
 
     if args.list:

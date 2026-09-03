@@ -145,6 +145,20 @@ class IKPEstimateV2ArtifactTests(unittest.TestCase):
                     "results": [{"tier": "T1", "verdict": verdict}],
                 }), 1)
 
+    def test_missing_or_unknown_tier_and_required_fields_are_rejected(self):
+        records = [
+            {"verdict": "CORRECT"},
+            {"tier": "T8", "verdict": "CORRECT"},
+            {"tier": "T1"},
+            "not a record",
+        ]
+        for record in records:
+            with self.subTest(record=record):
+                self.assertEqual(self.run_from_results({
+                    "status": "completed",
+                    "results": [record],
+                }), 1)
+
     def test_legacy_valid_artifact_without_status_is_rescored(self):
         artifact = {
             "model": "legacy-model",

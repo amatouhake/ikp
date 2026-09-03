@@ -38,6 +38,7 @@ import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 
@@ -475,11 +476,10 @@ Reply one word: CORRECT, REFUSAL, or WRONG"""
         if not isinstance(raw, str) or not raw.strip():
             raise JudgeAPIError("successful response contained no judge text")
         raw = raw.strip().upper()
-        if raw.startswith("CORRECT"):
-            return "CORRECT"
-        if raw.startswith("REFUSAL"):
-            return "REFUSAL"
-        return "WRONG"
+        match = re.match(r"^(CORRECT|REFUSAL|WRONG)(?:\s|$)", raw)
+        if match:
+            return match.group(1)
+        raise JudgeAPIError(f"unrecognized judge verdict: {raw[:80]!r}")
 
     return judge
 
@@ -540,11 +540,24 @@ def stratified_sample(probes: list, sample_size: int,
 
 
 def _is_openrouter_base(api_base: str) -> bool:
-    return "openrouter.ai" in api_base.lower()
+    try:
+        parsed = urlparse(api_base)
+    except ValueError:
+        return False
+    return parsed.scheme in ("http", "https") and parsed.hostname == "openrouter.ai"
 
 
 def _is_opencode_go_base(api_base: str) -> bool:
-    return "opencode.ai/zen/go" in api_base.lower()
+    try:
+        parsed = urlparse(api_base)
+    except ValueError:
+        return False
+    path = parsed.path.rstrip("/")
+    return (
+        parsed.scheme in ("http", "https")
+        and parsed.hostname == "opencode.ai"
+        and (path == "/zen/go" or path.startswith("/zen/go/"))
+    )
 
 
 def resolve_target_api_key(api_base: str, explicit_api_key: str | None) -> str:

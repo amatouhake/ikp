@@ -96,9 +96,13 @@ def tier_stats_from_results(results):
     """Aggregate per-tier {correct, wrong, refusal, total} from probe records."""
     stats = defaultdict(lambda: {"correct": 0, "wrong": 0, "refusal": 0, "total": 0})
     for r in results:
-        t = r["tier"]
+        if not isinstance(r, dict):
+            raise ValueError("result record must be an object")
+        t = r.get("tier")
+        if t not in TIERS:
+            raise ValueError(f"unknown result tier: {t!r}")
         stats[t]["total"] += 1
-        v = r["verdict"]
+        v = r.get("verdict")
         if v == "CORRECT":
             stats[t]["correct"] += 1
         elif v == "REFUSAL":
@@ -110,7 +114,7 @@ def tier_stats_from_results(results):
     return stats
 
 
-def validate_result_artifact(data):
+def validate_result_artifact(data, require_probe_id=False):
     """Validate a v1 result artifact before offline re-scoring."""
     if not isinstance(data, dict):
         raise ValueError("results artifact must be a JSON object")
@@ -125,13 +129,24 @@ def validate_result_artifact(data):
 
     invalid = []
     for index, result in enumerate(results):
-        verdict = result.get("verdict") if isinstance(result, dict) else None
-        if verdict not in VALID_VERDICTS:
-            invalid.append(f"#{index}={verdict!r}")
+        if not isinstance(result, dict):
+            invalid.append(f"#{index}: record is not an object")
+            continue
+        if "tier" not in result:
+            invalid.append(f"#{index}: missing tier")
+        elif result["tier"] not in TIERS:
+            invalid.append(f"#{index}: unknown tier {result['tier']!r}")
+        if "verdict" not in result:
+            invalid.append(f"#{index}: missing verdict")
+        elif result["verdict"] not in VALID_VERDICTS:
+            invalid.append(f"#{index}: unknown verdict {result['verdict']!r}")
+        if require_probe_id and not result.get("probe_id"):
+            invalid.append(f"#{index}: missing probe_id for split scoring")
     if invalid:
         raise ValueError(
-            "results artifact contains INFRASTRUCTURE_ERROR or unknown "
-            f"verdict(s): {', '.join(invalid)}"
+            "results artifact contains malformed records: "
+            f"{'; '.join(invalid[:10])}"
+            + (f"; ... {len(invalid) - 10} more" if len(invalid) > 10 else "")
         )
     return results
 
@@ -322,7 +337,7 @@ def run_from_results(args):
     with open(args.from_results) as results_file:
         data = json.load(results_file)
     try:
-        results = validate_result_artifact(data)
+        results = validate_result_artifact(data, require_probe_id=args.split != "all")
     except ValueError as exc:
         print(f"Error: refusing to re-score {args.from_results}: {exc}",
               file=sys.stderr)
