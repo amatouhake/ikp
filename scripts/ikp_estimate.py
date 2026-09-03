@@ -475,10 +475,9 @@ Reply one word: CORRECT, REFUSAL, or WRONG"""
         raw = message.get("content") if isinstance(message, dict) else None
         if not isinstance(raw, str) or not raw.strip():
             raise JudgeAPIError("successful response contained no judge text")
-        raw = raw.strip().upper()
-        match = re.match(r"^(CORRECT|REFUSAL|WRONG)(?:\s|$)", raw)
-        if match:
-            return match.group(1)
+        raw = raw.strip()
+        if raw in ("CORRECT", "REFUSAL", "WRONG"):
+            return raw
         raise JudgeAPIError(f"unrecognized judge verdict: {raw[:80]!r}")
 
     return judge

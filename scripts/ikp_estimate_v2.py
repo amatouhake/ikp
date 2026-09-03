@@ -114,7 +114,8 @@ def tier_stats_from_results(results):
     return stats
 
 
-def validate_result_artifact(data, require_probe_id=False):
+def validate_result_artifact(data, require_probe_id=False,
+                             known_probe_ids=None):
     """Validate a v1 result artifact before offline re-scoring."""
     if not isinstance(data, dict):
         raise ValueError("results artifact must be a JSON object")
@@ -138,10 +139,16 @@ def validate_result_artifact(data, require_probe_id=False):
             invalid.append(f"#{index}: unknown tier {result['tier']!r}")
         if "verdict" not in result:
             invalid.append(f"#{index}: missing verdict")
+        elif not isinstance(result["verdict"], str):
+            invalid.append(f"#{index}: verdict is not a string")
         elif result["verdict"] not in VALID_VERDICTS:
             invalid.append(f"#{index}: unknown verdict {result['verdict']!r}")
-        if require_probe_id and not result.get("probe_id"):
-            invalid.append(f"#{index}: missing probe_id for split scoring")
+        if require_probe_id:
+            probe_id = result.get("probe_id")
+            if not isinstance(probe_id, str) or not probe_id.strip():
+                invalid.append(f"#{index}: missing probe_id for split scoring")
+            elif known_probe_ids is not None and probe_id not in known_probe_ids:
+                invalid.append(f"#{index}: unknown probe_id {probe_id!r}")
     if invalid:
         raise ValueError(
             "results artifact contains malformed records: "
@@ -336,15 +343,25 @@ def run_live(args):
 def run_from_results(args):
     with open(args.from_results) as results_file:
         data = json.load(results_file)
+    assignment = None
+    if args.split != "all":
+        assignment = load_split() or {}
+        if not assignment:
+            print("Error: refusing to re-score without a split manifest.",
+                  file=sys.stderr)
+            sys.exit(1)
     try:
-        results = validate_result_artifact(data, require_probe_id=args.split != "all")
+        results = validate_result_artifact(
+            data,
+            require_probe_id=args.split != "all",
+            known_probe_ids=set(assignment) if assignment is not None else None,
+        )
     except ValueError as exc:
         print(f"Error: refusing to re-score {args.from_results}: {exc}",
               file=sys.stderr)
         sys.exit(1)
     model_name = data.get("model", Path(args.from_results).stem)
     if args.split != "all":
-        assignment = load_split() or {}
         results = [r for r in results if assignment.get(r.get("probe_id")) == args.split]
     if not results:
         print("  No probe records found (need a v1 --output JSON with 'results').")

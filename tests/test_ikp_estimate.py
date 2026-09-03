@@ -219,7 +219,7 @@ class IKPEstimateTransportTests(unittest.TestCase):
         self.assertEqual(len(client.requests), 3)
 
     def test_judge_rejects_unrecognized_labels(self):
-        for label in ("I cannot decide", "CORRECTNESS"):
+        for label in ("CORRECT because ...", "I cannot decide", "CORRECTNESS"):
             with self.subTest(label=label):
                 client = FakeClient([FakeResponse(200, {
                     "choices": [{"message": {"content": label}}]
@@ -231,6 +231,19 @@ class IKPEstimateTransportTests(unittest.TestCase):
 
                 with self.assertRaises(ikp.JudgeAPIError):
                     judge("question", "gold", "answer")
+
+    def test_judge_accepts_only_exact_label_after_stripping(self):
+        for label in ("CORRECT", " CORRECT\n"):
+            with self.subTest(label=repr(label)):
+                client = FakeClient([FakeResponse(200, {
+                    "choices": [{"message": {"content": label}}]
+                })])
+                judge = ikp.make_judge_fn(
+                    "judge-key", client_factory=lambda timeout: client,
+                    sleep_fn=lambda seconds: None,
+                )
+
+                self.assertEqual(judge("question", "gold", "answer"), "CORRECT")
 
     def test_judge_success_keeps_fixed_request_and_scoring(self):
         client = FakeClient([FakeResponse(200, {

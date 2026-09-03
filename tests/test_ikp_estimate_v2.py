@@ -116,11 +116,11 @@ class IKPEstimateV2LiveTests(unittest.TestCase):
 
 
 class IKPEstimateV2ArtifactTests(unittest.TestCase):
-    def run_from_results(self, artifact):
+    def run_from_results(self, artifact, split="all"):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "results.json"
             path.write_text(json.dumps(artifact))
-            args = SimpleNamespace(from_results=str(path), split="all")
+            args = SimpleNamespace(from_results=str(path), split=split)
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
                 io.StringIO()
             ):
@@ -138,7 +138,7 @@ class IKPEstimateV2ArtifactTests(unittest.TestCase):
         }), 1)
 
     def test_infrastructure_and_unknown_verdicts_are_rejected(self):
-        for verdict in ("INFRASTRUCTURE_ERROR", "MAYBE"):
+        for verdict in ("INFRASTRUCTURE_ERROR", "MAYBE", [], {}):
             with self.subTest(verdict=verdict):
                 self.assertEqual(self.run_from_results({
                     "status": "completed",
@@ -174,6 +174,45 @@ class IKPEstimateV2ArtifactTests(unittest.TestCase):
         show.assert_called_once()
         self.assertEqual(show.call_args.args[0], "legacy-model")
         self.assertEqual(show.call_args.args[2], 1)
+
+    def test_split_manifest_accepts_requested_and_opposite_known_ids(self):
+        assignment = ikp_v2.load_split()
+        requested_id = next(
+            probe_id for probe_id, split in assignment.items()
+            if split == "private"
+        )
+        opposite_id = next(
+            probe_id for probe_id, split in assignment.items()
+            if split == "public"
+        )
+        artifact = {
+            "status": "completed",
+            "model": "legacy-model",
+            "results": [
+                {"probe_id": requested_id, "tier": "T1", "verdict": "CORRECT"},
+                {"probe_id": opposite_id, "tier": "T1", "verdict": "WRONG"},
+            ],
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "split.json"
+            path.write_text(json.dumps(artifact))
+            args = SimpleNamespace(from_results=str(path), split="private")
+            with patch.object(ikp_v2, "show") as show:
+                ikp_v2.run_from_results(args)
+
+        show.assert_called_once()
+        self.assertEqual(show.call_args.args[2], 1)
+
+    def test_split_manifest_rejects_unknown_probe_id(self):
+        self.assertEqual(self.run_from_results({
+            "status": "completed",
+            "results": [{
+                "probe_id": "not-a-real-probe",
+                "tier": "T1",
+                "verdict": "CORRECT",
+            }],
+        }, split="private"), 1)
 
 
 if __name__ == "__main__":
