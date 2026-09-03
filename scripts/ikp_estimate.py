@@ -46,6 +46,7 @@ PROJECT_ROOT = Path(__file__).parent.parent
 PROBE_FILE = PROJECT_ROOT / "data" / "probes" / "final_probe_set_v8.json"
 SYSTEM_MSG = "Answer factual questions directly and concisely. If you don't know, say 'I don't know'."
 JUDGE_MODEL = "google/gemini-3-flash-preview"
+OPENCODE_GO_USER_AGENT = "amatouhake-ikp/0.1 (+https://github.com/amatouhake/ikp)"
 HALLUCINATION_PENALTY = 0.0  # no penalty: wrong answers score the same as refusals (λ=0)
 TIERS = ["T1", "T2", "T3", "T4", "T5", "T6", "T7"]
 API_STYLES = ("chat", "responses")
@@ -252,6 +253,8 @@ def target_request_preview(api_base: str, model: str,
         api_base, model, "<question>", api_style, reasoning_effort, is_thinking
     )
     headers = {"Content-Type": "application/json"}
+    if _is_opencode_go_base(api_base):
+        headers["User-Agent"] = OPENCODE_GO_USER_AGENT
     if has_api_key:
         headers["Authorization"] = "Bearer <redacted>"
     return {
@@ -398,6 +401,8 @@ def make_query_fn(api_base: str, api_key: str, model: str,
             api_base, model, question, api_style, effort
         )
         headers = {"Content-Type": "application/json"}
+        if _is_opencode_go_base(api_base):
+            headers["User-Agent"] = OPENCODE_GO_USER_AGENT
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
 

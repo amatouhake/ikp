@@ -96,6 +96,9 @@ class IKPEstimateTransportTests(unittest.TestCase):
         self.assertEqual(
             request["url"], "https://opencode.ai/zen/go/v1/responses"
         )
+        self.assertEqual(
+            request["headers"]["User-Agent"], ikp.OPENCODE_GO_USER_AGENT
+        )
         self.assertEqual(request["json"], {
             "model": "muse-spark-1.3-contributor",
             "instructions": ikp.SYSTEM_MSG,
@@ -141,6 +144,9 @@ class IKPEstimateTransportTests(unittest.TestCase):
         serialized = json.dumps(preview)
         self.assertNotIn("go-key", serialized)
         self.assertEqual(preview["headers"]["Authorization"], "Bearer <redacted>")
+        self.assertEqual(
+            preview["headers"]["User-Agent"], ikp.OPENCODE_GO_USER_AGENT
+        )
         self.assertEqual(preview["payload"]["reasoning"], {"effort": "xhigh"})
 
     def test_opencode_target_key_is_separate_from_judge_key(self):
@@ -199,6 +205,7 @@ class IKPEstimateTransportTests(unittest.TestCase):
         request = client.requests[0]
         self.assertEqual(request["url"],
                          "https://openrouter.ai/api/v1/chat/completions")
+        self.assertNotIn("User-Agent", request["headers"])
         self.assertEqual(request["json"]["model"], ikp.JUDGE_MODEL)
         self.assertEqual(request["json"]["temperature"], 0)
         self.assertEqual(request["json"]["reasoning"], {"effort": "low"})
