@@ -47,6 +47,7 @@ v1 = importlib.import_module("ikp_estimate")  # reuse query/judge/calibration
 PROJECT_ROOT = Path(__file__).parent.parent
 SPLIT_FILE = PROJECT_ROOT / "data" / "probes" / "split_manifest_v2.json"
 TIERS = ["T1", "T2", "T3", "T4", "T5", "T6", "T7"]
+VALID_VERDICTS = frozenset(("CORRECT", "REFUSAL", "WRONG"))
 CALIB_MAX_B = 1600.0  # largest OPEN model in the calibration cohort (deepseek-v4-pro,
 #                       1.6T); above this the estimate is extrapolation
 
@@ -71,7 +72,8 @@ RESET = "\033[0m"
 def load_split():
     if not SPLIT_FILE.exists():
         return None
-    return json.load(open(SPLIT_FILE)).get("assignment", {})
+    with open(SPLIT_FILE) as split_file:
+        return json.load(split_file).get("assignment", {})
 
 
 def filter_probes(probes, split, which):
@@ -101,9 +103,37 @@ def tier_stats_from_results(results):
             stats[t]["correct"] += 1
         elif v == "REFUSAL":
             stats[t]["refusal"] += 1
-        else:
+        elif v == "WRONG":
             stats[t]["wrong"] += 1
+        else:
+            raise ValueError(f"unknown benchmark verdict: {v!r}")
     return stats
+
+
+def validate_result_artifact(data):
+    """Validate a v1 result artifact before offline re-scoring."""
+    if not isinstance(data, dict):
+        raise ValueError("results artifact must be a JSON object")
+    if "status" in data and data["status"] != "completed":
+        raise ValueError(
+            f"results artifact status is not completed: {data['status']!r}"
+        )
+
+    results = data.get("results", [])
+    if not isinstance(results, list):
+        raise ValueError("results artifact 'results' must be a list")
+
+    invalid = []
+    for index, result in enumerate(results):
+        verdict = result.get("verdict") if isinstance(result, dict) else None
+        if verdict not in VALID_VERDICTS:
+            invalid.append(f"#{index}={verdict!r}")
+    if invalid:
+        raise ValueError(
+            "results artifact contains INFRASTRUCTURE_ERROR or unknown "
+            f"verdict(s): {', '.join(invalid)}"
+        )
+    return results
 
 
 def robust_estimate(stats):
@@ -197,20 +227,38 @@ def show(model_name, est, n_probes, split):
 
 # ── Live run (thin wrapper over v1's query+judge) ──────────────
 def run_live(args):
-    probes = json.load(open(v1.PROBE_FILE))
+    with open(v1.PROBE_FILE) as probe_file:
+        probes = json.load(probe_file)
     split = load_split()
     probes = filter_probes(probes, split, args.split)
 
-    api_key = args.api_key or os.environ.get("OPENROUTER_API_KEY", "")
-    if not api_key and "openrouter" in args.api_base:
-        print("Error: OPENROUTER_API_KEY not set.")
+    api_style = getattr(args, "api_style", "chat")
+    reasoning_effort = getattr(args, "reasoning_effort", "default")
+    is_thinking = getattr(args, "thinking", False)
+    explicit_api_key = getattr(args, "api_key", None)
+    api_key = v1.resolve_target_api_key(args.api_base, explicit_api_key)
+    if not api_key and (v1._is_openrouter_base(args.api_base)
+                        or v1._is_opencode_go_base(args.api_base)):
+        env_name = ("OPENCODE_GO_API_KEY"
+                    if v1._is_opencode_go_base(args.api_base)
+                    else "OPENROUTER_API_KEY")
+        print(f"Error: {env_name} not set for the target.")
         sys.exit(1)
-    judge_key = os.environ.get("OPENROUTER_API_KEY", api_key)
+
+    # The fixed judge credential is independent of the target credential.
+    judge_key = os.environ.get("OPENROUTER_API_KEY", "")
     if not judge_key:
         print("Error: OPENROUTER_API_KEY needed for the judge.")
         sys.exit(1)
 
-    query_fn = v1.make_query_fn(args.api_base, api_key, args.model, args.thinking)
+    query_fn = v1.make_query_fn(
+        args.api_base,
+        api_key,
+        args.model,
+        is_thinking=is_thinking,
+        api_style=api_style,
+        reasoning_effort=reasoning_effort,
+    )
     judge_fn = v1.make_judge_fn(judge_key)
 
     print(f"\n  Scoring {args.model} on {len(probes)} probes (split: {args.split})...")
@@ -218,8 +266,28 @@ def run_live(args):
     results = []
 
     def eval_one(p):
-        resp = query_fn(p["question"])
-        return {"tier": p["tier"], "verdict": judge_fn(p["question"], p["answer"], resp)}
+        try:
+            resp = query_fn(p["question"])
+        except v1.TargetAPIError as exc:
+            return {
+                "probe_id": p.get("id", ""),
+                "tier": p["tier"],
+                "verdict": "INFRASTRUCTURE_ERROR",
+                "error_type": "target_api",
+                "error": str(exc),
+            }
+
+        try:
+            verdict = judge_fn(p["question"], p["answer"], resp)
+        except v1.JudgeAPIError as exc:
+            return {
+                "probe_id": p.get("id", ""),
+                "tier": p["tier"],
+                "verdict": "INFRASTRUCTURE_ERROR",
+                "error_type": "judge_api",
+                "error": str(exc),
+            }
+        return {"tier": p["tier"], "verdict": verdict}
 
     workers = 1 if args.sequential else args.workers
     with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -227,14 +295,38 @@ def run_live(args):
         for f in as_completed(futures):
             results.append(f.result())
 
+    infrastructure_errors = [
+        result for result in results
+        if result.get("verdict") == "INFRASTRUCTURE_ERROR"
+    ]
+    if infrastructure_errors:
+        print(
+            f"Error: {len(infrastructure_errors)} infrastructure error(s); "
+            "no estimate was computed or scored.",
+            file=sys.stderr,
+        )
+        for result in infrastructure_errors[:3]:
+            print(
+                f"  {result['probe_id']}: {result['error_type']} - "
+                f"{result['error']}",
+                file=sys.stderr,
+            )
+        sys.exit(1)
+
     est = robust_estimate(tier_stats_from_results(results))
     show(args.model, est, len(results), args.split)
 
 
 # ── Offline re-score of a v1 results file ──────────────────────
 def run_from_results(args):
-    data = json.load(open(args.from_results))
-    results = data.get("results", [])
+    with open(args.from_results) as results_file:
+        data = json.load(results_file)
+    try:
+        results = validate_result_artifact(data)
+    except ValueError as exc:
+        print(f"Error: refusing to re-score {args.from_results}: {exc}",
+              file=sys.stderr)
+        sys.exit(1)
     model_name = data.get("model", Path(args.from_results).stem)
     if args.split != "all":
         assignment = load_split() or {}
@@ -253,7 +345,13 @@ def main():
     ap.add_argument("--model", "-m", help="Target model ID")
     ap.add_argument("--api-base", default="https://openrouter.ai/api/v1")
     ap.add_argument("--api-key")
-    ap.add_argument("--thinking", action="store_true")
+    ap.add_argument("--api-style", choices=v1.API_STYLES, default="chat",
+                    help="Target API style: chat (default) or responses")
+    ap.add_argument("--thinking", action="store_true",
+                    help="Backward-compatible alias for --reasoning-effort medium")
+    ap.add_argument("--reasoning-effort", choices=v1.REASONING_EFFORTS,
+                    default="default",
+                    help="Target reasoning override: default, low, medium, high, xhigh")
     ap.add_argument("--split", choices=["all", "public", "private"], default="private",
                     help="Which probe split to score (default: private — contamination-resistant)")
     ap.add_argument("--workers", "-w", type=int, default=16)
